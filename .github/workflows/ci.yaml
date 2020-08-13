@@ -1,0 +1,26 @@
+name: Fakemachine Continuous Integration
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    name: Build Fakemachine
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Go compiler
+        uses: actions/setup-go@v2
+        with:
+          go-version: 1.11
+        id: go
+
+      - name: Checkout fakemachine source
+        uses: actions/checkout@v2
+
+      - name: Build fakemachine on host
+        env:
+          GOSRC: /home/runner/go/src
+          GOBIN: /home/runner/go/bin
+        run: |
+          mkdir -p ${GOSRC}/github.com/go-debos
+          ln -s $(pwd) ${GOSRC}/github.com/go-debos/fakemachine
+          go get -v ./...
