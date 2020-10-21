@@ -10,6 +10,7 @@ import (
 )
 
 type Options struct {
+	Backend	    string   `short:"b" long:"backend" description:"Virtualisation backend to use" default:"auto" choice:"auto"` // choices for backend are built-up by reflection
 	Volumes     []string `short:"v" long:"volume" description:"volume to mount"`
 	Images      []string `short:"i" long:"image" description:"image to add"`
 	Memory      int      `short:"m" long:"memory" description:"Amount of memory for the fakemachine in megabytes"`
@@ -68,6 +69,10 @@ func SetupImages(m *fakemachine.Machine, options Options) {
 }
 
 func main() {
+	// append the list of available backends to the commandline argument parser
+	opt := parser.FindOptionByLongName("backend")
+	opt.Choices = append(opt.Choices, fakemachine.GetAvailableBackends()...)
+
 	args, err := parser.Parse()
 	if err != nil {
 		flagsErr, ok := err.(*flags.Error)

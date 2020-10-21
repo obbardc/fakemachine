@@ -95,6 +95,11 @@ func Supported() bool {
 	return true
 }
 
+func GetAvailableBackends() []string {
+	// TODO update this from reflection
+	return []string{"kvm", "uml"}
+}
+
 const initScript = `#!/bin/busybox sh
 
 busybox mount -t proc proc /proc
