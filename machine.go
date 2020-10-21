@@ -5,6 +5,7 @@ package fakemachine
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/go-debos/fakemachine/cpio"
 	"golang.org/x/sys/unix"
@@ -540,7 +542,8 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 		"systemd.unit=fakemachine.service",
 		"console=tty0",
 		//"vec0:transport=libslirp,dst=/tmp/libslirp",
-		"vec0:transport=bess,dst=/tmp/libslirp",
+		//"vec0:transport=bess,dst=/tmp/libslirp",
+		"vec0:transport=fd,fd=3,vec=0",
 	}
 	//kernelargs := []string{"console=ttyS0", "panic=-1",
 	//"systemd.unit=fakemachine.service"}
@@ -592,10 +595,65 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 		//		i, i, img.label))
 	}
 
+
+	// TODO depreciated? https://godoc.org/golang.org/x/sys
+	// create a socketpair https://gist.github.com/changkun/0e45f970df23de107b45ae1799749519
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_DGRAM, 0)
+	if err != nil {
+		return -1, err
+	}
+
+	// attached to SLIRP helper
+	f1 := os.NewFile(uintptr(fds[0]), "")
+	if f1 == nil {
+		return -1, errors.New("socketpair: f1 is incorrect")
+	}
+	defer f1.Close()
+
+	// attached to UML
+	f2 := os.NewFile(uintptr(fds[1]), "")
+	if f2 == nil {
+		return -1, errors.New("socketpair: f2 is incorrect")
+	}
+	defer f2.Close()
+
+	// TODO launch the slirp helper and attach dgram socketpair using --fd=0 argument
+	slirp_args := []string{"libslirp-helper",
+			       "--fd=3",
+			       "--exit-with-parent"}
+//			       "--debug",
+
+	slirp_pa := os.ProcAttr{
+		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr, f1},
+	}
+
+	// TODO use proper path
+	//p_slirp, err := os.StartProcess("/usr/local/bin/libslirp-helper", slirp_args, &slirp_pa)
+	p_slirp, err := os.StartProcess("/home/obbardc/projects/debos/uml/libslirp-rs/target/debug/libslirp-helper", slirp_args, &slirp_pa)
+	if err != nil {
+		return -1, err
+	}
+	defer p_slirp.Kill()
+
+
+	// TODO attach socketpair to UML
+
+
+
 	//qemuargs = append(qemuargs, "-append", strings.Join(kernelargs, " "))
 
+	// open the shared socket for networking
+	/*netsock, err := os.Create("/tmp/libslirp")
+	if err != nil {
+		return -1, err
+	}*/
+	/*netsock, err := net.ListenUnix("unix", "/tmp/libslirp")
+	if err != nil {
+		return -1, err
+	}*/
+
 	pa := os.ProcAttr{
-		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
+		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr, f2},
 	}
 
 	if p, err := os.StartProcess("/usr/bin/linux", qemuargs, &pa); err != nil {
