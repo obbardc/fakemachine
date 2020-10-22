@@ -67,7 +67,8 @@ func NewMachine() (m *Machine) {
 		m.addStaticVolume("/bin", "bin")
 		m.addStaticVolume("/lib", "lib")
 	}
-	m.AddVolumeAt("/usr/lib/uml/modules", "/lib/modules")
+	//m.AddVolumeAt("/usr/lib/uml/modules", "/lib/modules")
+	m.AddVolumeAt("/home/obbardc/projects/debos/uml/linux-uml/modules/lib/modules", "/lib/modules")
 	// Mount for ssl certificates
 	if _, err := os.Stat("/etc/ssl"); err == nil {
 		m.AddVolume("/etc/ssl")
@@ -544,6 +545,10 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 		//"vec0:transport=libslirp,dst=/tmp/libslirp",
 		//"vec0:transport=bess,dst=/tmp/libslirp",
 		"vec0:transport=fd,fd=3,vec=0",
+		//"root=/dev/ram0",
+		//"rootfstype=ramfs",
+		//"rw",
+		//"init=/init",
 	}
 	//kernelargs := []string{"console=ttyS0", "panic=-1",
 	//"systemd.unit=fakemachine.service"}
@@ -561,6 +566,11 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 			"con0=fd:0,fd:1", // tty0 to stdin/stdout when showing boot
 			"con=none")       // no other consoles
 	} else {
+		// don't show the UML message output by default
+		qemuargs = append(qemuargs,
+			"quiet")
+
+
 		//qemuargs = append(qemuargs,
 		// Create the bus for virtio consoles
 		//	"-device", "virtio-serial",
@@ -594,7 +604,6 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 		//	fmt.Sprintf("virtio-blk-pci,drive=drive-virtio-disk%d,id=virtio-disk%d,serial=%s",
 		//		i, i, img.label))
 	}
-
 
 	// TODO depreciated? https://godoc.org/golang.org/x/sys
 	// create a socketpair https://gist.github.com/changkun/0e45f970df23de107b45ae1799749519
@@ -635,7 +644,6 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 	}
 	defer p_slirp.Kill()
 
-
 	// TODO attach socketpair to UML
 
 
@@ -656,7 +664,8 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr, f2},
 	}
 
-	if p, err := os.StartProcess("/usr/bin/linux", qemuargs, &pa); err != nil {
+	if p, err := os.StartProcess("/home/obbardc/projects/debos/uml/linux-uml/linux", qemuargs, &pa); err != nil {
+	//if p, err := os.StartProcess("/usr/bin/linux", qemuargs, &pa); err != nil {
 		return -1, err
 	} else {
 		p.Wait()
