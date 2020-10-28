@@ -68,7 +68,11 @@ func NewMachine() (m *Machine) {
 		m.addStaticVolume("/lib", "lib")
 	}
 	//m.AddVolumeAt("/usr/lib/uml/modules", "/lib/modules")
+
+	// TODO this is the right path
 	m.AddVolumeAt("/home/obbardc/projects/debos/uml/linux-uml/modules/lib/modules", "/lib/modules")
+
+
 	// Mount for ssl certificates
 	if _, err := os.Stat("/etc/ssl"); err == nil {
 		m.AddVolume("/etc/ssl")
@@ -98,11 +102,6 @@ func Supported() bool {
 	return true
 }
 
-func GetAvailableBackends() []string {
-	// TODO update this from reflection
-	return []string{"kvm", "uml"}
-}
-
 const initScript = `#!/bin/busybox sh
 
 busybox mount -t proc proc /proc
@@ -123,7 +122,6 @@ if ! busybox test -L /bin ; then
 	busybox mount none /lib -o /lib -t hostfs
 	#busybox mount -v -t 9p -o trans=virtio,version=9p2000.L,cache=loose,msize=262144 lib /lib
 fi
-busybox mount none /lib/modules -o /usr/lib/uml/modules -t hostfs
 #exec busybox ash
 exec /lib/systemd/systemd
 `
@@ -344,6 +342,7 @@ func (m *Machine) kernelRelease() (string, error) {
 
 func (m *Machine) writerKernelModules(w *writerhelper.WriterHelper) error {
 	kernelRelease, err := m.kernelRelease()
+	fmt.Printf("kernel release: %s\n", kernelRelease)
 	if err != nil {
 		return err
 	}
@@ -374,6 +373,7 @@ func (m *Machine) writerKernelModules(w *writerhelper.WriterHelper) error {
 		if mergedUsrSystem() {
 			usrpath = "/usr/lib/modules"
 		}
+		fmt.Printf("Copying %s\n", path.Join(usrpath, kernelRelease, v))
 		if err := w.CopyFile(path.Join(usrpath, kernelRelease, v)); err != nil {
 			return err
 		}
@@ -496,6 +496,7 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 		"/etc/systemd/system-generators/lvm2-activation-generator",
 		0755)
 
+	fmt.Printf("Writing kernel modules\n")
 	m.writerKernelModules(w)
 
 	// By default we send job output to the second virtio console,
