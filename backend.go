@@ -10,7 +10,7 @@ import(
 )
 
 func BackendNames() []string {
-	return []string{"auto", "kvm"}
+	return []string{"auto", "kvm", "uml"}
 }
 
 // A static backend has no machine or state associated with it, it is purely for
@@ -28,9 +28,24 @@ func newBackend(backendName string, m Machine) (backend, error) {
 
 	switch backendName {
 	case "auto":
-		fallthrough
+		// select kvm first
+		b, kvm_err := newBackend("kvm", m)
+		if kvm_err == nil {
+			return b, nil
+		}
+
+		// falling back to uml
+		b, uml_err := newBackend("uml", m)
+		if uml_err == nil {
+			return b, nil
+		}
+
+		// no backends supported
+		return nil, fmt.Errorf("%v, %v", kvm_err, uml_err)
 	case "kvm":
 		b = newKvmBackend(m)
+	case "uml":
+		b = newUmlBackend(m)
 	default:
 		return nil, fmt.Errorf("backend %s does not exist", backendName)
 	}
