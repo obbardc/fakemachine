@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"text/template"
 
 	"github.com/go-debos/fakemachine/cpio"
 	"golang.org/x/sys/unix"
@@ -33,31 +34,49 @@ type mountPoint struct {
 	hostDirectory    string
 	machineDirectory string
 	label            string
+	static           bool
 }
 
 type image struct {
 	path  string
 	label string
+	index int
 }
 
 type Machine struct {
-	mounts   []mountPoint
-	count    int
-	images   []image
-	memory   int
-	numcpus  int
-	showBoot bool
-	Environ  []string
+	backendName string
+	mounts      []mountPoint
+	count       int
+	images      []image
+	memory      int
+	numcpus     int
+	showBoot    bool
+	Environ     []string
 
+	initrdpath  string
 	scratchsize int64
 	scratchpath string
 	scratchfile string
 	scratchdev  string
 }
 
-// Create a new machine object
+// Create a new machine object using the "auto" backend
 func NewMachine() (m *Machine) {
-	m = &Machine{memory: 2048, numcpus: runtime.NumCPU()}
+	m, err := NewMachineFromBackend("auto")
+	if err != nil {
+		panic(err)
+	}
+	return
+}
+
+// Create a new machine object with choice of backend
+func NewMachineFromBackend(backendName string) (*Machine, error) {
+	b, err := getStaticBackend(backendName)
+	if err != nil {
+		return nil, err
+	}
+
+	m := &Machine{backendName: b.Name(), memory: 2048, numcpus: runtime.NumCPU()}
 	// usr is mounted by specific label via /init
 	m.addStaticVolume("/usr", "usr")
 
@@ -86,7 +105,7 @@ func NewMachine() (m *Machine) {
 		m.AddVolume("/var/lib/binfmts")
 	}
 
-	return
+	return m, nil
 }
 
 func InMachine() (ret bool) {
@@ -96,8 +115,8 @@ func InMachine() (ret bool) {
 }
 
 func Supported() bool {
-	_, err := os.Stat("/dev/kvm")
-	return err == nil
+	_, err := getStaticBackend("auto")
+	return err != nil
 }
 
 const initScript = `#!/bin/busybox sh
@@ -105,22 +124,21 @@ const initScript = `#!/bin/busybox sh
 busybox mount -t proc proc /proc
 busybox mount -t sysfs none /sys
 
-busybox modprobe virtio_pci
-busybox modprobe virtio_console
-busybox modprobe 9pnet_virtio
-busybox modprobe 9p
+# probe additional modules
+{{ range $m := .InitModules }}
+busybox modprobe {{ $m }}
+{{ end }}
 
-busybox mount -v -t 9p -o trans=virtio,version=9p2000.L,cache=loose,msize=262144 usr /usr
-if ! busybox test -L /bin ; then
-	busybox mount -v -t 9p -o trans=virtio,version=9p2000.L,cache=loose,msize=262144 sbin /sbin
-	busybox mount -v -t 9p -o trans=virtio,version=9p2000.L,cache=loose,msize=262144 bin /bin
-	busybox mount -v -t 9p -o trans=virtio,version=9p2000.L,cache=loose,msize=262144 lib /lib
-fi
+# mount static volumes
+{{ range $m := .StaticVolumes }}
+{{ mount $ $m }}
+{{ end }}
+
 exec /lib/systemd/systemd
 `
 const networkd = `
 [Match]
-Name=e*
+Name={{ .NetworkdMatch }}
 
 [Network]
 DHCP=ipv4
@@ -175,8 +193,42 @@ SendSIGHUP=yes
 LimitNOFILE=4096
 `
 
+// helper function to generate a mount command for a given mountpoint
+func tmplMount(b backend, m mountPoint) string {
+	fsType, options := b.MountParameters(m)
+
+	mntCommand := []string{"busybox", "mount", "-v"}
+	mntCommand = append(mntCommand, "-t", fsType)
+	if len(options) > 0 {
+		mntCommand = append(mntCommand, "-o", strings.Join(options, ","))
+	}
+	// FIXME: shell escaping?
+	mntCommand = append(mntCommand, m.label)
+	mntCommand = append(mntCommand, m.machineDirectory)
+	return strings.Join(mntCommand, " ")
+}
+
+// Parse a template, passing the Machine as the only parameter
+func parseTemplate(tmplStr string, b *backend) []byte {
+	helperFuncs := template.FuncMap{
+		"mount": tmplMount,
+	}
+
+	tmpl := template.Must(template.New("template").Funcs(helperFuncs).Parse(tmplStr))
+	out := &bytes.Buffer{}
+	if err := tmpl.Execute(out, b); err != nil {
+		panic(err)
+	}
+	return out.Bytes()
+}
+
+// Static volumes are mounted at boot
 func (m *Machine) addStaticVolume(directory, label string) {
-	m.mounts = append(m.mounts, mountPoint{directory, directory, label})
+	m.addVolume(mountPoint{directory, directory, label, true})
+}
+
+func (m *Machine) addVolume(mount mountPoint) {
+	m.mounts = append(m.mounts, mount)
 }
 
 // AddVolumeAt mounts hostDirectory from the host at machineDirectory in the
@@ -189,7 +241,7 @@ func (m *Machine) AddVolumeAt(hostDirectory, machineDirectory string) {
 			return
 		}
 	}
-	m.mounts = append(m.mounts, mountPoint{hostDirectory, machineDirectory, label})
+	m.mounts = append(m.mounts, mountPoint{hostDirectory, machineDirectory, label, false})
 	m.count = m.count + 1
 }
 
@@ -203,7 +255,8 @@ func (m *Machine) AddVolume(directory string) {
 // it in the fake machine using the given label as the serial id. If size is -1
 // then the image should already exist and the size isn't modified.
 //
-// label needs to be less then 20 characters due to limitations from qemu
+// label needs to be less than 20 characters due to backend limitations.
+// There is no guarantee a label can be applied to the image by the backend.
 //
 // The returned string is the device path of the new image as seen inside
 // fakemachine.
@@ -239,9 +292,16 @@ func (m *Machine) CreateImageWithLabel(path string, size int64, label string) (s
 	}
 
 	i.Close()
-	m.images = append(m.images, image{path, label})
+	index := len(m.images)
+	img := image{path, label, index}
+	m.images = append(m.images, img)
 
-	return fmt.Sprintf("/dev/disk/by-id/virtio-%s", label), nil
+	backend, err := getStaticBackend(m.backendName)
+	if err != nil {
+		return "", err
+	}
+
+	return backend.MachineImagePath(img), nil
 }
 
 // CreateImage does the same as CreateImageWithLabel but lets the library pick
@@ -281,7 +341,17 @@ func (m *Machine) SetScratch(scratchsize int64, path string) {
 	}
 }
 
-func (m *Machine) generateFstab(w *writerhelper.WriterHelper) {
+func (m *Machine) staticVolumes() []mountPoint {
+	mounts := []mountPoint{}
+	for _, mount := range m.mounts {
+		if mount.static {
+			mounts = append(mounts, mount)
+		}
+	}
+	return mounts
+}
+
+func (m *Machine) generateFstab(w *writerhelper.WriterHelper, b backend) {
 	fstab := []string{"# Generated fstab file by fakemachine"}
 
 	if m.scratchfile == "" {
@@ -291,10 +361,11 @@ func (m *Machine) generateFstab(w *writerhelper.WriterHelper) {
 			m.scratchdev))
 	}
 
-	for _, point := range m.mounts {
-		fstab = append(fstab,
-			fmt.Sprintf("%s %s 9p trans=virtio,version=9p2000.L,cache=loose,msize=262144 0 0",
-				point.label, point.machineDirectory))
+	// mount volumes
+	for _, mount := range m.mounts {
+		fstype, options := b.MountParameters(mount)
+		fstab = append(fstab, fmt.Sprintf("%s %s %s %s 0 0",
+				mount.label, mount.machineDirectory, fstype, strings.Join(options, ",")))
 	}
 	fstab = append(fstab, "")
 
@@ -305,7 +376,28 @@ func (m *Machine) SetEnviron(environ []string) {
 	m.Environ = environ
 }
 
-func (m *Machine) kernelRelease() (string, error) {
+// The name of the backend to be used to run this machine.
+// If the machine was created with the auto backend, this value is evaluated to
+// the chosen backed
+func (m *Machine) BackendName() string {
+	return m.backendName
+}
+
+func hostKernelPath() (string, error) {
+	kernelRelease, err := hostKernelRelease()
+	if err != nil {
+		return "", err
+	}
+
+	kernelPath := "/boot/vmlinuz-" + kernelRelease
+	if _, err := os.Stat(kernelPath); err != nil {
+		return "", err
+	}
+
+	return kernelPath, nil
+}
+
+func hostKernelRelease() (string, error) {
 	/* First try the kernel the current system is running, but if there are no
 	 * modules for that try the latest from /lib/modules. The former works best
 	 * for systems directly running fakemachine, the latter makes sense in docker
@@ -337,42 +429,31 @@ func (m *Machine) kernelRelease() (string, error) {
 	return "", fmt.Errorf("No kernel found")
 }
 
-func (m *Machine) writerKernelModules(w *writerhelper.WriterHelper) error {
-	kernelRelease, err := m.kernelRelease()
-	if err != nil {
-		return err
+// Writes the specified kernel modules into the initrd. Skips over modules which
+// are builtin to the kernel, returns an error if any modules cannot be found.
+// Also checks for compressed modules.
+func (m *Machine) writerKernelModules(w *writerhelper.WriterHelper, moddir string, modules []string) error {
+	if len(modules) == 0 {
+		return nil
 	}
 
-	modules := []string{
-		"kernel/drivers/char/virtio_console.ko",
-		"kernel/drivers/virtio/virtio.ko",
-		"kernel/drivers/virtio/virtio_pci.ko",
-		"kernel/net/9p/9pnet.ko",
-		"kernel/drivers/virtio/virtio_ring.ko",
-		"kernel/fs/9p/9p.ko",
-		"kernel/net/9p/9pnet_virtio.ko",
-		"kernel/fs/fscache/fscache.ko",
-		"modules.order",
-		"modules.builtin",
-		"modules.dep",
-		"modules.dep.bin",
-		"modules.alias",
-		"modules.alias.bin",
-		"modules.softdep",
-		"modules.symbols",
-		"modules.symbols.bin",
-		"modules.builtin.bin",
-		"modules.devname"}
-
-	moddir := "/lib/modules"
-	if mergedUsrSystem() {
-		moddir = "/usr/lib/modules"
-	}
+	modules = append(modules,
+			"modules.order",
+			"modules.builtin",
+			"modules.dep",
+			"modules.dep.bin",
+			"modules.alias",
+			"modules.alias.bin",
+			"modules.softdep",
+			"modules.symbols",
+			"modules.symbols.bin",
+			"modules.builtin.bin",
+			"modules.devname")
 
 	// build a list of built-in modules so that we don’t attempt to copy them
 	var builtinModules = make(map[string]bool)
 
-	f, err := os.Open(path.Join(moddir, kernelRelease, "modules.builtin"))
+	f, err := os.Open(path.Join(moddir, "modules.builtin"))
 	if err != nil {
 		return err
 	}
@@ -393,7 +474,7 @@ func (m *Machine) writerKernelModules(w *writerhelper.WriterHelper) error {
 			continue
 		}
 
-		modpath := path.Join(moddir, kernelRelease, v)
+		modpath := path.Join(moddir, v)
 
 		if strings.HasSuffix(modpath, ".ko") {
 			if _, err := os.Stat(modpath); err != nil {
@@ -459,9 +540,14 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 		return -1, err
 	}
 
-	InitrdPath := path.Join(tmpdir, "initramfs.cpio")
-	f, err := os.OpenFile(InitrdPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
+	m.initrdpath = path.Join(tmpdir, "initramfs.cpio")
+	f, err := os.OpenFile(m.initrdpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
 
+	if err != nil {
+		return -1, err
+	}
+
+	backend, err := newBackendFromMachine(*m)
 	if err != nil {
 		return -1, err
 	}
@@ -523,24 +609,26 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 	w.CopyFile("/etc/group")
 	w.CopyFile("/etc/nsswitch.conf")
 
-	w.WriteFile("/etc/systemd/network/ethernet.network", networkd, 0444)
+	w.WriteFileRaw("/etc/systemd/network/ethernet.network", parseTemplate(networkd, &backend), 0444)
 	w.WriteSymlink(
 		"/lib/systemd/resolv.conf",
 		"/etc/resolv.conf",
 		0755)
 
-	m.writerKernelModules(w)
-
-	// By default we send job output to the second virtio console,
-	// reserving /dev/ttyS0 for boot messages (which we ignore)
-	// and /dev/hvc0 for possible use by systemd as a getty
-	// (which we also ignore).
-	tty := "/dev/hvc0"
-	if m.showBoot {
-		// If we are debugging a failing boot, mix job output into
-		// the normal console messages instead, so we can see both.
-		tty = "/dev/console"
+	// copy kernel modules into initrd
+	if modules := backend.RequiredModules(); len(modules) > 0 {
+		moddir, err := backend.KernelModulesDir()
+		if err != nil {
+			return -1, err
+		}
+		if err = m.writerKernelModules(w, moddir, modules); err != nil {
+			return -1, err
+		}
 	}
+
+	// the backend chooses the TTY for the fakemachine service
+	tty := backend.JobOutputTTY()
+
 	w.WriteFile("etc/systemd/system/fakemachine.service",
 		fmt.Sprintf(serviceTemplate, tty, strings.Join(m.Environ, " ")), 0644)
 
@@ -552,9 +640,10 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 	w.WriteFile("/wrapper",
 		fmt.Sprintf(commandWrapper, command), 0755)
 
-	w.WriteFile("/init", initScript, 0755)
+	// create /init
+	w.WriteFileRaw("/init", parseTemplate(initScript, &backend), 0755)
 
-	m.generateFstab(w)
+	m.generateFstab(w, backend)
 
 	for _, v := range extracontent {
 		w.CopyFileTo(v[0], v[1])
@@ -563,72 +652,9 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 	w.Close()
 	f.Close()
 
-	kernelRelease, err := m.kernelRelease()
+	exitcode, err := backend.Start()
 	if err != nil {
-		return -1, err
-	}
-	memory := fmt.Sprintf("%d", m.memory)
-	numcpus := fmt.Sprintf("%d", m.numcpus)
-	qemuargs := []string{"qemu-system-x86_64",
-		"-cpu", "host",
-		"-smp", numcpus,
-		"-m", memory,
-		"-enable-kvm",
-		"-kernel", "/boot/vmlinuz-" + kernelRelease,
-		"-initrd", InitrdPath,
-		"-display", "none",
-		"-no-reboot"}
-	kernelargs := []string{"console=ttyS0", "panic=-1",
-		"systemd.unit=fakemachine.service"}
-
-	if m.showBoot {
-		// Create a character device representing our stdio
-		// file descriptors, and connect the emulated serial
-		// port (which is the console device for the BIOS,
-		// Linux and systemd, and is also connected to the
-		// fakemachine script) to that device
-		qemuargs = append(qemuargs,
-			"-chardev", "stdio,id=for-ttyS0,signal=off",
-			"-serial", "chardev:for-ttyS0")
-	} else {
-		qemuargs = append(qemuargs,
-			// Create the bus for virtio consoles
-			"-device", "virtio-serial",
-			// Create /dev/ttyS0 to be the VM console, but
-			// ignore anything written to it, so that it
-			// doesn't corrupt our terminal
-			"-chardev", "null,id=for-ttyS0",
-			"-serial", "chardev:for-ttyS0",
-			// Connect the fakemachine script to our stdio
-			// file descriptors
-			"-chardev", "stdio,id=for-hvc0,signal=off",
-			"-device", "virtconsole,chardev=for-hvc0")
-	}
-
-	for _, point := range m.mounts {
-		qemuargs = append(qemuargs, "-virtfs",
-			fmt.Sprintf("local,mount_tag=%s,path=%s,security_model=none",
-				point.label, point.hostDirectory))
-	}
-
-	for i, img := range m.images {
-		qemuargs = append(qemuargs, "-drive",
-			fmt.Sprintf("file=%s,if=none,format=raw,cache=unsafe,id=drive-virtio-disk%d", img.path, i))
-		qemuargs = append(qemuargs, "-device",
-			fmt.Sprintf("virtio-blk-pci,drive=drive-virtio-disk%d,id=virtio-disk%d,serial=%s",
-				i, i, img.label))
-	}
-
-	qemuargs = append(qemuargs, "-append", strings.Join(kernelargs, " "))
-
-	pa := os.ProcAttr{
-		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
-	}
-
-	if p, err := os.StartProcess("/usr/bin/qemu-system-x86_64", qemuargs, &pa); err != nil {
-		return -1, err
-	} else {
-		p.Wait()
+		return exitcode, fmt.Errorf("error starting %s: %v", m.backendName, err)
 	}
 
 	result, err := os.Open(path.Join(tmpdir, "result"))
@@ -637,7 +663,7 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 	}
 
 	exitstr, _ := ioutil.ReadAll(result)
-	exitcode, err := strconv.Atoi(strings.TrimSpace(string(exitstr)))
+	exitcode, err = strconv.Atoi(strings.TrimSpace(string(exitstr)))
 
 	if err != nil {
 		return -1, err
