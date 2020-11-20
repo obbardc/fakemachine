@@ -10,8 +10,19 @@ import (
 	"testing"
 )
 
+var backend string
+
+func init() {
+	flag.StringVar(&backend, "backend", "", "Backend to use")
+}
+
 func TestSuccessfullCommand(t *testing.T) {
-	m := NewMachine()
+	m, err := NewMachineFromBackend(backend)
+	if err != nil {
+		t.Fatalf("error creating machine for backend %s: %v", backend, err)
+	}
+
+	t.Fatalf("Got backend %s", backend)
 
 	exitcode, _ := m.Run("ls /")
 
