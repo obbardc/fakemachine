@@ -7,5 +7,5 @@ require (
 	github.com/jessevdk/go-flags v1.5.0
 	github.com/stretchr/testify v1.7.1
 	github.com/surma/gocpio v1.0.2-0.20130630172628-c01aebd00e02
-	golang.org/x/sys v0.0.0-20220330033206-e17cdc41300f
+	golang.org/x/sys v0.6.0
 )
